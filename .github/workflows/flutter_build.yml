@@ -1,0 +1,212 @@
+name: FinVexa - Build e Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: finvexa-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FLUTTER_VERSION: '3.47.9'
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      build: ${{ steps.version.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validar tag e versão do projeto
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" != refs/tags/* ]]; then
+            echo "::error::Selecione uma tag vMAJOR.MINOR.PATCH para executar este workflow."
+            exit 1
+          fi
+          spec=$(sed -n 's/^version:[[:space:]]*//p' pubspec.yaml)
+          if [[ ! "$spec" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\+([1-9][0-9]*)$ ]]; then
+            echo "::error::Use version: MAJOR.MINOR.PATCH+BUILD no pubspec.yaml."
+            exit 1
+          fi
+          version="${BASH_REMATCH[1]}"
+          build="${BASH_REMATCH[2]}"
+          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::A tag deve ser v$version."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+  android-linux:
+    needs: validate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Instalar ferramentas Linux
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - run: flutter pub get --enforce-lockfile
+      - name: Gerar APK
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [[ -n "$ANDROID_KEYSTORE_BASE64" ]]; then
+            export ANDROID_KEYSTORE_PATH="$RUNNER_TEMP/finvexa.jks"
+            trap 'rm -f "$ANDROID_KEYSTORE_PATH"' EXIT
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$ANDROID_KEYSTORE_PATH"
+          else
+            echo "::warning::APK assinado com a chave de depuração. Configure ANDROID_KEYSTORE_BASE64 para distribuir atualizações."
+          fi
+          flutter build apk --release --no-pub
+          mkdir -p dist
+          install -m 644 build/app/outputs/flutter-apk/app-release.apk dist/FinVexa.apk
+      - name: Gerar pacote Debian
+        env:
+          DEB_VERSION: ${{ needs.validate.outputs.version }}-${{ needs.validate.outputs.build }}
+        run: |
+          flutter build linux --release --no-pub
+          bundle=build/linux/x64/release/bundle
+          test -x "$bundle/finvexa"
+          root=$(mktemp -d)
+          install -d "$root/DEBIAN" "$root/usr/lib/finvexa" "$root/usr/bin"
+          cp -a "$bundle/." "$root/usr/lib/finvexa/"
+          mv "$root/usr/lib/finvexa/share" "$root/usr/share"
+          ln -s ../lib/finvexa/finvexa "$root/usr/bin/finvexa"
+          cat > "$root/DEBIAN/control" <<EOF
+          Package: finvexa
+          Version: $DEB_VERSION
+          Architecture: $(dpkg --print-architecture)
+          Maintainer: FinVexa <${GITHUB_REPOSITORY_OWNER}@users.noreply.github.com>
+          Homepage: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}
+          Section: office
+          Priority: optional
+          Depends: libc6 (>= 2.39), libgcc-s1, libstdc++6, libgtk-3-0t64 | libgtk-3-0, liblzma5
+          Description: FinVexa financial reporting workspace
+           Create, compare, audit and export financial reports.
+          EOF
+          dpkg-deb --root-owner-group --build "$root" dist/FinVexa-amd64.deb
+          dpkg-deb --info dist/FinVexa-amd64.deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: finvexa-android-linux
+          path: dist/
+          if-no-files-found: error
+
+  windows:
+    needs: validate
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - run: flutter pub get --enforce-lockfile
+      - run: flutter build windows --release --no-pub
+      - name: Empacotar o runtime do Visual C++
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (!$vs) { throw 'Visual Studio com ferramentas C++ indisponível.' }
+          $crt = Get-ChildItem (Join-Path $vs 'VC\Redist\MSVC') -Directory |
+            Sort-Object { [version]$_.Name } -Descending |
+            ForEach-Object { Get-ChildItem (Join-Path $_.FullName 'x64\Microsoft.VC*.CRT') -Directory } |
+            Select-Object -First 1
+          if (!$crt) { throw 'Runtime redistribuível do Visual C++ indisponível.' }
+          Copy-Item (Join-Path $crt.FullName '*.dll') build/windows/x64/runner/Release/
+      - name: Gerar instalador Inno Setup
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          choco install innosetup -y --no-progress
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          & $iscc "/DAppVersion=$env:APP_VERSION" installer/finvexa.iss
+          exit $LASTEXITCODE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: finvexa-windows
+          path: dist/FinVexa-Setup-x64.exe
+          if-no-files-found: error
+
+  apple:
+    needs: validate
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+      - run: flutter pub get --enforce-lockfile
+      - name: Gerar imagem DMG
+        run: |
+          flutter build macos --release --no-pub
+          mkdir -p dist
+          staging=$(mktemp -d)
+          ditto build/macos/Build/Products/Release/finvexa.app "$staging/FinVexa.app"
+          ln -s /Applications "$staging/Applications"
+          hdiutil create -volname FinVexa -srcfolder "$staging" -format UDZO dist/FinVexa-macOS.dmg
+          hdiutil verify dist/FinVexa-macOS.dmg
+      - name: Gerar IPA
+        env:
+          IOS_CERTIFICATE_BASE64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          IOS_PROFILE_BASE64: ${{ secrets.IOS_PROFILE_BASE64 }}
+          IOS_BUNDLE_ID: ${{ vars.IOS_BUNDLE_ID }}
+        run: bash installer/build_ipa.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: finvexa-apple
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: [android-linux, windows, apple]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: finvexa-*
+          path: dist
+          merge-multiple: true
+      - name: Publicar no GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          ipa=FinVexa-iOS-unsigned.ipa
+          if [[ -s FinVexa-iOS.ipa ]]; then ipa=FinVexa-iOS.ipa; fi
+          files=(FinVexa.apk FinVexa-amd64.deb FinVexa-Setup-x64.exe FinVexa-macOS.dmg "$ipa")
+          for file in "${files[@]}"; do test -s "$file"; done
+          sha256sum "${files[@]}" > SHA256SUMS.txt
+          gh release create "$GITHUB_REF_NAME" "${files[@]}" SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
+            --title "FinVexa $GITHUB_REF_NAME"

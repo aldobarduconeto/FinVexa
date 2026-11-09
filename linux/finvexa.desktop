@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=FinVexa
+Comment=Comparação e auditoria de relatórios financeiros
+Exec=finvexa
+Icon=finvexa
+Terminal=false
+Categories=Office;Finance;
